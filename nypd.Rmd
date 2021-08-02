@@ -1,0 +1,145 @@
+---
+title: "Shooting Incidents in NYC Spiked in 2020"
+author: "Michael Bailey"
+date: "7/15/2021"
+output: html_document
+bibliography: data.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+I will be using the `tidyverse` package for data import, manipulation, and plotting, the `lubridate` package for handling dates, the `viridis` package for plot colors, and the `forecast` package for analyzing time series data.
+
+```{r libs, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(viridis)
+library(forecast)
+```
+
+## Import
+
+The [NYPD Shooting Incident Data (Historic)](https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8) data set was obtained from the NYC Open Data Portal. The data set is provided by the New York Police Department. It includes a record of every shooting incident that occurred in NYC from 2006 through the end of 2020, with information related to suspect and victim demographics, and the location, date, and time of the incident. I will use `read_csv` to import the data set, and apply formatting specifications to the columns. 
+
+```{r import, message=FALSE}
+rawData <- read_csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD",
+                col_types = cols(
+                  INCIDENT_KEY = col_double(),
+                  OCCUR_DATE = col_date(format = "%m/%d/%Y"),
+                  OCCUR_TIME = col_time(format = "%H:%M:%S"),
+                  BORO = col_factor(),
+                  PRECINCT = col_factor(),
+                  JURISDICTION_CODE = col_double(),
+                  LOCATION_DESC = col_factor(),
+                  STATISTICAL_MURDER_FLAG = col_logical(),
+                  PERP_AGE_GROUP = col_factor(),
+                  PERP_SEX = col_factor(),
+                  PERP_RACE = col_factor(),
+                  VIC_AGE_GROUP = col_factor(),
+                  VIC_SEX = col_factor(),
+                  VIC_RACE = col_factor(),
+                  X_COORD_CD = col_number(),
+                  Y_COORD_CD = col_number(),
+                  Latitude = col_double(),
+                  Longitude = col_double()
+                ))
+```
+
+## Tidy and Transform
+
+The raw data contains multiple rows for individual incidents as a result of there being multiple perpetrators or victims. The individuals in these groups may not distinguishable by combination of the age, race, and sex information present in the data. This is illustrated in the following example of a single incident.
+
+```{r dupExample}
+dupCols <- c("PERP_AGE_GROUP", "PERP_SEX", "PERP_RACE", "VIC_AGE_GROUP", "VIC_SEX", "VIC_RACE", "STATISTICAL_MURDER_FLAG")
+rawData %>%
+  add_count(INCIDENT_KEY, sort = TRUE) %>%
+  slice_head(n = 18) %>%
+  select(all_of(dupCols))
+```
+
+Clearly multiple perpetrators and victims were involved, but it is not possible to say how many. The same perpetrator may be represented on multiple rows to allow for multiple victims (or vice versa), but it is also possible to have two perpetrators with the same demographics. I will limit my analysis to the frequency of shooting incidents over time, so I will discard these columns and keep only the information to uniquely identify and date each occurrence. Using `summary`, we see that there are no missing values in these columns.
+
+```{r tidying}
+data <- rawData %>%
+  select(INCIDENT_KEY, OCCUR_DATE) %>%
+  distinct() %>%
+  arrange(OCCUR_DATE)
+summary(data)
+```
+
+I will create additional columns for the month, year, and calendar month of the occurrences, and summarize the data by counting the number of monthly incidents.
+
+```{r transform}
+data <- data %>%
+  mutate(OCCUR_MONTH = month(OCCUR_DATE, label = TRUE),
+         OCCUR_DATE_MONTH = floor_date(OCCUR_DATE, "month"),
+         OCCUR_YEAR = year(OCCUR_DATE))
+
+monthlyData <- data %>%
+  count(OCCUR_DATE_MONTH, OCCUR_MONTH, OCCUR_YEAR, name = "OCCUR_MONTH_COUNT")
+```
+## Analysis
+
+A cursory inspection of the frequency of incidents over time reveals a seasonal pattern. More shootings appear to be reported in summer than in winter. This is shown below by plotting the 15 years of monthly data by calendar month.
+
+```{r timeseries}
+monthlyData %>%
+  ggplot(aes(x = OCCUR_MONTH, y = OCCUR_MONTH_COUNT, group = OCCUR_YEAR, color = OCCUR_YEAR)) + 
+  geom_line() + 
+  geom_point() +
+  scale_color_viridis(end = 0.9, breaks = c(2006,2010,2015,2020)) +
+  theme_classic() +
+  labs(title = "Shooting incidence varies by time of year",
+       subtitle = "NYC shootings from 2006 through 2020",
+       x = "Month",
+       y = "Number of shootings",
+       color = "Year")
+```
+
+To separate the seasonal effects from any underlying trends, I will use Seasonal and Trend decomposition using Loess (STL) [@Cleveland90] via the `stl` function in the `forecast` package. The function requires a `ts` object, so I will create one from the monthly summary. This method decomposes the data into three components: seasonal, trend, and remainder, using locally weighted regression, or loess, to fit a smooth curve to the data. The seasonal component represents a pattern in the data that recurs over a fixed period of time, one year in this case, whereas the trend describes the long-term, non-seasonal changes in the data. The remainder is simply the residual of model, representing the variation in the data that is not accounted for by the seasonal and trend components. The relationship at each time point $t$ between the actual data $A_t$, trend $T_t$, seasonal $S_t$, and remainder $R_t$ is:
+
+$$A_t = T_t+S_t+R_t$$
+
+The plot of the decomposed data below further clarifies the seasonality of the data. The rate of shootings follows an annual cycle of higher rates in the summer and lower rates in the winter. Furthermore, there was a downward trend in the number of shooting incidents from 2006 until 2020, when there was a large spike.
+
+```{r seasons}
+plotData <- ts(monthlyData$OCCUR_MONTH_COUNT, frequency = 12, start = c(2006, 1)) %>%
+  stl(s.window = 11) %>%
+  as_tibble(x = .[[1]]) %>%
+  bind_cols(monthlyData, .) %>%
+  pivot_longer(cols = all_of(c("OCCUR_MONTH_COUNT","seasonal","trend","remainder"))) %>%
+  filter(name != "remainder")
+  
+ggplot(plotData, aes(x = OCCUR_DATE_MONTH, y = value, color = name)) +
+  geom_point(data = filter(plotData, name == "OCCUR_MONTH_COUNT")) + 
+  geom_line(data = filter(plotData, name == "trend")) +
+  geom_area(data = filter(plotData, name == "seasonal"),
+            fill = viridis(3, option = "D", alpha = 0.2)[2],
+            show.legend = FALSE) +
+  scale_color_viridis(end = 0.9, direction = -1, option = "D", 
+                      discrete = TRUE,
+                      breaks = c("OCCUR_MONTH_COUNT", "trend", "seasonal"),
+                      labels = c("Actual", "Trend", "Seasonal"),
+                      guide = 
+                        guide_legend(title = NULL,
+                                     override.aes = list(shape = c(19,NA,NA),
+                                                         linetype = c(0,1,1))))+
+  labs(title = "Seasonal decomposition of monthly shooting incidence",
+       subtitle = "NYC shootings from 2006 through 2020",
+       x = "Date (year)", y = "Number of Shootings per Month") +
+  geom_hline(yintercept = 0) +
+  scale_y_continuous(n.breaks = 8) +
+  theme_classic()
+```
+
+## Conclusion
+
+My analysis shows that the frequency of shooting incidents in NYC was decreasing from 2006 to 2019, followed by a surge in the summer of 2020. This effect is too large to be attributed to the regular increase observed in previous summers. Indeed, the increase was reported in the media [@Watkins20], and attributed to various causes by different groups. NYC mayor Bill de Blasio and police commissioner, Dermot F. Shea, have blamed the pandemic, George Floyd protests, and cash bail reform in the state [@Feuer20]. Future work is needed to evaluate these claims, and discover true causes to the marked increase in shootings.
+
+The limited scope of this analysis should somewhat insulate it from bias. Still, the data is provided by the NYPD, a clear stakeholder in any conclusions. Additionally, the data must be influenced by policing practices overtime, i.e. more shooting incidents will appear in the data when/where there is more enforcement by police. Finally, I am writing this from the perspective of an outsider, who hears about what happens in NYC largely through national media. I tried to avoid drawing conclusions that extend beyond the scope of this analysis. 
+
+## References
